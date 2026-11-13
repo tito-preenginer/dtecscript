@@ -2,8 +2,6 @@
     KLZE Hub — Drill to Earth's Core (place 74507545904779)
     v1.9 — TERRA farm/loot/esp/combat/drill on KLZE Obsidian UI.
     Shop watch and the old depth overlay are not included.
-    KLZE_DTEC_TERRA_SCRIPT  KLZE-TERRA-B13  (marcador: la auto-ejecucion usa esto para
-    reconocer ESTE script y no otro; no lo borres)
 ]]
 
 if typeof(getgenv) == "function" then
@@ -15281,6 +15279,7 @@ function S.isAutofarmCruiseHeld()
         or Autofarm._oreHuntMode == true
         or Autofarm._scrapProcessing == true
         or Autofarm._scrapFlushing == true
+        or (type(CoreFarm) == "table" and CoreFarm._pickGrabbing == true)
 end
 
 function S.stopKlzeRouteGlide()
@@ -15543,6 +15542,9 @@ function S.lockAutofarmHover(enabled)
             return
         end
         if Autofarm.moving then
+            return
+        end
+        if type(CoreFarm) == "table" and CoreFarm._pickGrabbing == true then
             return
         end
         local root = S.getRoot()
@@ -19799,6 +19801,9 @@ function S.findChestForAutofarm()
     if Autofarm.openChests ~= true then
         return nil
     end
+    if type(CoreFarm) == "table" and CoreFarm._phase == "pick" then
+        return nil -- laps de Pick Up: no se abren mas cofres
+    end
     if #S.chestSelectionList(Autofarm.chestTypes) == 0 then
         return nil
     end
@@ -19940,6 +19945,9 @@ end
 function S.autofarmVisitChest(chest)
     if not chest or not Autofarm.enabled or Autofarm.openChests ~= true then
         return false
+    end
+    if type(CoreFarm) == "table" and CoreFarm._phase == "pick" then
+        return false -- laps de Pick Up: no se abren mas cofres
     end
 
     chest = S.resolveDungeonChestModel(chest) or chest
@@ -23265,9 +23273,11 @@ CoreFarm = {
     chestSpeed = 1500, -- velocidad de las laps de cofres
     pickSpeed = 1500, -- velocidad de las laps de Pick Up
     pickLaps = 1, -- cuantas laps de Pick Up (1-10) tras acabar las de cofres
+    pickRange = 300, -- rango de deteccion (studs) controlado por el usuario: items dentro de este radio se agarran
     _phase = nil, -- nil/"chests" = abriendo cofres · "pick" = laps de Pick Up
     _pickActive = false, -- true solo durante la fase de Pick Up
     pickLapsDone = 0,
+    _finished = false,
     church = true, -- opcion (toggle "Go to Church after laps"): tras las laps ir al church y luego al lobby
 }
 
@@ -23326,6 +23336,7 @@ function S.coreSaveQueue()
         pickLaps = CoreFarm.pickLaps,
         chestSpeed = CoreFarm.chestSpeed,
         pickSpeed = CoreFarm.pickSpeed,
+        pickRange = CoreFarm.pickRange,
         church = CoreFarm.church == true,
     }
     pcall(writefile, CORE_FILE, HttpService:JSONEncode(payload))
@@ -23361,6 +23372,7 @@ function S.coreLoadQueue()
     CoreFarm.pickLaps = math.clamp(math.floor(tonumber(data.pickLaps) or 1), 1, 10)
     CoreFarm.chestSpeed = math.clamp(tonumber(data.chestSpeed) or 1500, 200, 4000)
     CoreFarm.pickSpeed = math.clamp(tonumber(data.pickSpeed) or 1500, 200, 4000)
+    CoreFarm.pickRange = math.clamp(tonumber(data.pickRange) or 300, 20, 2000)
     CoreFarm.church = data.church ~= false -- si no hay dato guardado, queda ON
 end
 
@@ -23388,11 +23400,11 @@ S.CORE_PICK_KIND_ALIASES = {
     chest = { "chest" }, -- tambien cubre "chestplate"
     helmet = { "helmet", "helm" },
     legs = { "legs", "leggings" },
-    boots = { "boots", "boot" },
+    boots = { "speedboots", "boots", "boot" }, -- Phoenix / Void / King's speed boots
 }
 S.CORE_PICK_KIND_LABEL = {
     shotgun = "Shotgun", sword = "Sword", rifle = "Rifle", pickaxe = "Pickaxe", revolver = "Revolver",
-    chest = "Chest", helmet = "Helmet", legs = "Legs", boots = "Boots",
+    chest = "Chest", helmet = "Helmet", legs = "Legs", boots = "Speed Boots",
 }
 -- Items sin familia (Void / Phoenix / King's no aplican).
 S.CORE_PICK_SINGLES = {
@@ -23426,7 +23438,73 @@ function S.pickBlobHas(blob, aliases)
 end
 
 -- Devuelve la etiqueta exacta ("Void Shotgun", "Excalibur"...) si el item esta en la lista, o nil.
-function S.corePickLabel(item)
+-- Item de la tienda (ShopItem / carteles de shop): no se puede recoger.
+function S.corePickIsShopItem(item)
+    if not item then
+        return false
+    end
+    if S.hasShopItemTag(item) or CollectionService:HasTag(item, "ShopItem") then
+        return true
+    end
+    local cur = item
+    for _ = 1, 10 do
+        if not cur or cur == Workspace then
+            break
+        end
+        if CollectionService:HasTag(cur, "ShopItem") then
+            return true
+        end
+        cur = cur.Parent
+    end
+    return S.isDecorativeOrShopChest(item)
+end
+
+-- Cofre contenedor (abierto, bloqueado o decorativo): NO es un drop que se recoge.
+function S.corePickIsChestContainer(item)
+    if not item then
+        return false
+    end
+    if S.isChestMarkedLocked(item) or S.isChestPadlocked(item) then
+        return true
+    end
+    local cur = item
+    for _ = 1, 8 do
+        if not cur or cur == Workspace then
+            break
+        end
+        if cur.Name == "ChestNode" or cur.Name == "ChestNodes" then
+            return true
+        end
+        cur = cur.Parent
+    end
+    if S.isChestEspTarget(item) or S.isTreasureChest(item) then
+        return true
+    end
+    -- Prompt de cofre ("Open" / "Unlock" / "Chest"). Una armadura chest se llama "chest" en
+    -- su ObjectText, asi que a la armadura solo se le revisa Open/Unlock.
+    local isArmor = S.isArmorWorldItem(item)
+    S._pickChestScan = S._pickChestScan or setmetatable({}, { __mode = "k" })
+    local cached = S._pickChestScan[item]
+    if cached and os.clock() - cached.at < 3 then
+        return cached.value
+    end
+    local value = false
+    for _, desc in ipairs(item:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") then
+            local obj = string.lower(desc.ObjectText or "")
+            local act = string.lower(desc.ActionText or "")
+            if act:find("open", 1, true) or act:find("unlock", 1, true)
+                or (not isArmor and obj:find("chest", 1, true)) then
+                value = true
+                break
+            end
+        end
+    end
+    S._pickChestScan[item] = { at = os.clock(), value = value }
+    return value
+end
+
+function S.corePickLabelBase(item)
     if not item or not item.Parent then
         return nil
     end
@@ -23439,6 +23517,14 @@ function S.corePickLabel(item)
     end
     local blob = string.lower(table.concat(bits, " ")):gsub("[^%a]", "")
     if blob:find("ammo", 1, true) or blob:find("crate", 1, true) then
+        return nil
+    end
+    -- No recoger items de la tienda ni cofres (bloqueados o no).
+    if S.corePickIsShopItem(item) or S.corePickIsChestContainer(item) then
+        return nil
+    end
+    -- "chest": solo la ARMADURA (Kings/Phoenix/Void chest piece), nunca el cofre.
+    if blob:find("chest", 1, true) and not S.isArmorWorldItem(item) then
         return nil
     end
     -- Cofres del mapa (Interactive + prompt) fuera de Workspace.Items no son drops.
@@ -23466,27 +23552,150 @@ function S.corePickLabel(item)
     return nil
 end
 
--- Agarra un item de la lista. Orden: mochila (Instant Pickup) -> acercarse y usar
--- mochila / prompt / Interact -> volver a la posicion original.
+-- Familia Void / Phoenix / King's de una pieza (por nombre), o nil.
+function S.corePickArmorFamily(item)
+    if not item then
+        return nil
+    end
+    local bits = { tostring(item.Name or "") }
+    for _, key in ipairs({ "DisplayName", "ArmorName", "ItemId", "ItemName" }) do
+        local value = item:GetAttribute(key)
+        if typeof(value) == "string" then
+            bits[#bits + 1] = value
+        end
+    end
+    local blob = string.lower(table.concat(bits, " ")):gsub("[^%a]", "")
+    blob = blob:gsub("kingslayer", "")
+    for _, fam in ipairs(S.CORE_PICK_FAMILIES) do
+        if S.pickBlobHas(blob, fam.aliases) then
+            return fam.key
+        end
+    end
+    return nil
+end
+
+-- Palabras que identifican cada slot de armadura (casco, pecho, piernas, botas / speed boots).
+S.CORE_ARMOR_SLOT_WORDS = {
+    Helmet = { "helmet", "helm" },
+    Chest = { "chest", "chestplate", "torso" },
+    Legs = { "legs", "leggings" },
+    Boots = { "boots", "boot" },
+}
+
+-- Slot de una pieza por su nombre (Void_Helmet, Kings_Chest, Phoenix_Legs, Speed Boots...).
+function S.corePickArmorSlotByName(item)
+    if not item then
+        return nil
+    end
+    local bits = { tostring(item.Name or "") }
+    for _, key in ipairs({ "DisplayName", "ArmorName", "ItemId", "ItemName" }) do
+        local value = item:GetAttribute(key)
+        if typeof(value) == "string" then
+            bits[#bits + 1] = value
+        end
+    end
+    local blob = string.lower(table.concat(bits, " ")):gsub("[^%a]", "")
+    for _, slot in ipairs({ "Helmet", "Legs", "Boots", "Chest" }) do
+        if S.pickBlobHas(blob, S.CORE_ARMOR_SLOT_WORDS[slot]) then
+            return slot
+        end
+    end
+    return nil
+end
+
+-- true si ya llevas puesta una pieza Void / Phoenix / King's en ese slot
+-- (Helmet / Chest / Legs / Boots). Evita el bucle equipar -> se cae la otra -> recoger.
+function S.coreHasFamilyArmorInSlot(slot)
+    if not slot then
+        return false
+    end
+    local okP, piece = pcall(S.getEquippedArmorPiece, slot)
+    if okP and piece and S.corePickArmorFamily(piece) ~= nil then
+        return true
+    end
+    -- Respaldo: busca en el personaje una pieza (accesorio / modelo / tool) con nombre
+    -- de familia + slot, por si el juego no la marca con atributos de armadura.
+    local char = LocalPlayer.Character
+    if char then
+        local words = S.CORE_ARMOR_SLOT_WORDS[slot] or {}
+        for _, inst in ipairs(char:GetDescendants()) do
+            if not inst:IsA("BasePart") and not inst:IsA("Attachment") and not inst:IsA("Motor6D")
+                and not inst:IsA("Weld") and not inst:IsA("WrapTarget") and not inst:IsA("Humanoid")
+            then
+                if S.corePickArmorSlotByName(inst) == slot and S.corePickArmorFamily(inst) ~= nil then
+                    return true
+                end
+            end
+        end
+        -- Slot reconocido sin pieza de familia puesta: no bloquear.
+        if okP and piece then
+            return false
+        end
+    end
+    -- Mientras se cambia de pieza puede no verse en el personaje: usa lo ultimo recordado.
+    local rec = GearEquip and GearEquip.slotBest and GearEquip.slotBest[slot]
+    if rec and (tick() - (tonumber(rec.at) or 0)) < 15 then
+        return S.corePickArmorFamily({
+            Name = tostring(rec.name or ""),
+            GetAttribute = function()
+                return nil
+            end,
+        }) ~= nil
+    end
+    return false
+end
+
+-- Etiqueta final: igual que la base, pero NO recoge una pieza de armadura (helmet, chest,
+-- legs, boots / speed boots) si ya tienes puesta una Void / Phoenix / King's en ese slot.
+function S.corePickLabel(item)
+    local label = S.corePickLabelBase(item)
+    if not label then
+        return nil
+    end
+    local slot = S.corePickArmorSlotByName(item)
+    if not slot then
+        local okA, isArmor = pcall(S.isArmorWorldItem, item)
+        if okA and isArmor then
+            local okS, key = pcall(S.getArmorSlotKey, item)
+            if okS then
+                slot = key
+            end
+        end
+    end
+    if slot and S.coreHasFamilyArmorInSlot(slot) then
+        return nil
+    end
+    return label
+end
+
 function S.corePickGone(item)
     return not item or not item.Parent or not item:IsDescendantOf(Workspace)
 end
 
+-- Agarra un item SIN Instant Pickup (sin mochila): se acerca, usa prompt / Interact y
+-- vuelve a su sitio.
 function S.corePickGrab(item)
+    CoreFarm._pickWhy = nil
     if S.corePickGone(item) then
         return true
     end
-    if S.sackPickupVerified(item) or S.corePickGone(item) then
-        return true
-    end
-    if Autofarm.busy == true and not CoreFarm._pickForce then
+    if Autofarm.busy == true and not CoreFarm._pickForce and CoreFarm._pickActive ~= true then
         return false
     end
+    CoreFarm._pickGrabbing = true
+    local okCall, result = pcall(S.corePickGrabInner, item)
+    CoreFarm._pickGrabbing = false
+    return okCall and result == true
+end
+
+function S.corePickGrabInner(item)
     local root = S.getRoot()
     local pos = S.getItemPosition(item)
     if not root or not pos then
+        CoreFarm._pickWhy = "sin posicion"
         return false
     end
+    local startedAt = os.clock()
     local home = root.CFrame
     root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
     root.AssemblyLinearVelocity = Vector3.zero
@@ -23494,7 +23703,10 @@ function S.corePickGrab(item)
     task.wait(0.2)
     local ok = false
     for _ = 1, 3 do
-        if S.corePickGone(item) or S.sackPickupVerified(item) then
+        if os.clock() - startedAt > 3 then
+            break -- tope de tiempo por item: no congelar el recorrido
+        end
+        if S.corePickGone(item) then
             ok = true
             break
         end
@@ -23514,12 +23726,6 @@ function S.corePickGrab(item)
             ok = true
             break
         end
-        S.bagPickup(item)
-        task.wait(0.15)
-        if S.corePickGone(item) then
-            ok = true
-            break
-        end
         local r = S.getRoot()
         local p2 = S.getItemPosition(item)
         if r and p2 then
@@ -23531,6 +23737,9 @@ function S.corePickGrab(item)
     if back then
         back.CFrame = home
         back.AssemblyLinearVelocity = Vector3.zero
+    end
+    if not ok then
+        CoreFarm._pickWhy = "el juego no lo acepto"
     end
     return ok
 end
@@ -23595,9 +23804,22 @@ function S.corePickupPassInner()
         if not pos then
             return
         end
+        -- Solo items CERCA: no hace viajes largos a zonas vacias / sin cargar (el recorrido
+        -- sigue y los va alcanzando). Los del cache "del mapa" son mas estrictos.
+        local rootNow = S.getRoot()
+        if not rootNow then
+            return
+        end
+        -- Rango de deteccion que controla el usuario (slider "Pick Up detection range").
+        -- Misma distancia para items normales y del cache "del mapa". Vertical: mismo rango
+        -- (minimo 300) para no perder items en cuevas / pisos distintos.
+        local maxRange = math.clamp(tonumber(CoreFarm.pickRange) or 300, 20, 2000)
+        if S.getFlatDistanceFromPosition(pos) > maxRange or math.abs(pos.Y - rootNow.Position.Y) > math.max(300, maxRange) then
+            return
+        end
         if not CoreFarm._pickSeen[item] then
             CoreFarm._pickSeen[item] = true
-            S.notify("Core", "Detectado: " .. label, 2)
+            S.notify("Core", "Se detectó: " .. label, 3)
         end
         list[#list + 1] = { item = item, label = label, dist = S.getFlatDistanceFromPosition(pos) }
     end
@@ -23623,14 +23845,17 @@ function S.corePickupPassInner()
         if ok then
             got += 1
             CoreFarm._pickTried[item] = nil
-            S.notify("Core", "Recogido: " .. entry.label, 2)
+            S.notify("Core", "Recogido: " .. entry.label, 3)
         else
             local prev = CoreFarm._pickTried[item]
             local fails = (prev and prev.fails or 0) + 1
             CoreFarm._pickTried[item] = {
                 fails = fails,
-                nextAt = os.clock() + (fails >= 5 and 30 or 1.5),
+                nextAt = os.clock() + (fails >= 3 and 40 or (fails == 2 and 15 or 4)), -- reintento rapido: antes un solo fallo lo bloqueaba 15 s y se pasaba de largo
             }
+            if fails == 1 then
+                S.notify("Core", "No se pudo recoger " .. entry.label .. ": " .. tostring(CoreFarm._pickWhy or "?"), 4)
+            end
         end
         task.wait(0.05)
     end
@@ -23673,7 +23898,9 @@ function S.coreStartPickupLoop()
 
     task.spawn(function()
         while true do
-            task.wait(0.25)
+            -- Durante la fase Pick Up escanea mas seguido: a velocidad alta de lap un item solo
+            -- queda dentro del rango una fraccion de segundo y se escapaba entre pasadas.
+            task.wait(CoreFarm._pickActive == true and 0.1 or 0.25)
             if CoreFarm._pickActive == true then
                 -- No pelear con el hold del cofre ni con el combate del Bounty Hunter.
                 local chestBusy = Autofarm.busy == true and Autofarm._holdReason == "chest"
@@ -24183,6 +24410,15 @@ function S.coreSyncFlags()
     setFlag("dtec_core_church", CoreFarm.church == true)
 end
 
+-- Pick Up laps activado? Lee tambien el toggle real: al restaurar settings en una partida
+-- nueva el flag se pone sin disparar el callback y CoreFarm.pickUp se quedaba en false.
+function S.corePickEnabled()
+    if CoreFarm.pickUp ~= true and S.coreToggleOn("dtec_core_pick_up") then
+        CoreFarm.pickUp = true
+    end
+    return CoreFarm.pickUp == true
+end
+
 function S.coreNoteLap()
     if not (CoreFarm.openAll or CoreFarm._ownedRun) or CoreFarm._leaving then
         return
@@ -24198,7 +24434,12 @@ function S.coreNoteLap()
         CoreFarm.pickLapsDone = (CoreFarm.pickLapsDone or 0) + 1
         local needPick = math.clamp(math.floor(tonumber(CoreFarm.pickLaps) or 1), 1, 10)
         S.notify("Core", "Pick Up lap " .. CoreFarm.pickLapsDone .. "/" .. needPick, 4)
-        if CoreFarm.pickUp == true and CoreFarm.pickLapsDone < needPick then
+        if S.corePickEnabled() and CoreFarm.pickLapsDone < needPick then
+            -- Nueva lap de Pick Up: reintenta TODO lo que no se pudo recoger en la anterior
+            -- (sin esperas de reintento) y vuelve a avisar de lo detectado.
+            CoreFarm._pickTried = {}
+            CoreFarm._pickSeen = setmetatable({}, { __mode = "k" })
+            S.notify("Core", "Lap " .. (CoreFarm.pickLapsDone + 1) .. ": reintentando items pendientes", 4)
             return
         end
         S.coreFinishRun()
@@ -24212,7 +24453,7 @@ function S.coreNoteLap()
     if CoreFarm.laps < need then
         return
     end
-    if CoreFarm.pickUp == true then
+    if S.corePickEnabled() then
         local needPick = math.clamp(math.floor(tonumber(CoreFarm.pickLaps) or 1), 1, 10)
         CoreFarm._phase = "pick"
         CoreFarm._pickActive = true
@@ -24224,11 +24465,15 @@ function S.coreNoteLap()
     S.coreFinishRun()
 end
 
--- Fin del run: (ultima recogida si hubo Pick Up) -> church (si esta activado) -> lobby.
+-- Fin del run: (ultima recogida si hubo Pick Up) -> church SOLO tras completar las laps de
+-- Pick Up (guarda gears y usa SU teleport; respaldo al lobby). Si no, vuelve al drill y
+-- se queda ahi. "Open all chests" NO se apaga.
 function S.coreFinishRun()
     CoreFarm._leaving = true
     CoreFarm.openAll = false
+    CoreFarm._finished = true -- no reiniciar el run en ESTA partida
     local before = CoreFarm._coresBefore
+    local didPick = CoreFarm._pickActive == true -- el church solo va tras las laps de Pick Up
     task.spawn(function()
         S.setAutofarm(false, { skipReturn = true })
         -- 1) Ultima recogida de la lista (solo si hubo fase Pick Up).
@@ -24250,8 +24495,9 @@ function S.coreFinishRun()
         end
         CoreFarm._pickActive = false
         CoreFarm._phase = nil
-        -- 2) Church (opcional): guarda gears y usa SU teleport para volver al lobby.
-        if CoreFarm.church == true then
+
+        if CoreFarm.church == true and didPick then
+            -- 2) Church (solo tras las laps de Pick Up): guarda gears y usa SU teleport para volver al lobby.
             local exitFired = false
             for attempt = 1, 3 do
                 S.notify("Core", "Church (intento " .. attempt .. "/3)...", 3)
@@ -24265,24 +24511,33 @@ function S.coreFinishRun()
             if exitFired then
                 task.wait(6) -- el teleport del church debio sacarnos
             end
+            task.wait(2)
+            -- 3) Respaldo: teleport al lobby normal si seguimos en la partida.
+            S.coreReturnLobby(before)
+        else
+            -- Sin church (apagado o sin laps de Pick Up): vuelve al drill y se queda ahi.
+            pcall(S.returnToDrillAfterFarmStop, { keepEngine = false, force = true })
+            S.coreReportCores(before)
+            S.notify("Core", "AutoCores listo · en el drill", 4)
         end
-        task.wait(2)
-        -- 3) Respaldo: teleport al lobby normal si seguimos en la partida.
-        S.coreReturnLobby(before)
     end)
 end
 
-function S.coreReturnLobby(before)
+function S.coreReportCores(before)
     local earned = tonumber(LocalPlayer:GetAttribute("CoresEarned")) or 0
     local after = tonumber(LocalPlayer:GetAttribute("Cores")) or 0
     local gained = after - (tonumber(before) or after)
     if gained > 0 then
-        S.notify("Core", "Account +" .. gained .. " cores. Leaving.", 5)
+        S.notify("Core", "Account +" .. gained .. " cores.", 5)
     elseif earned > 0 then
-        S.notify("Core", earned .. " cores this run. Leaving so they save.", 5)
+        S.notify("Core", earned .. " cores this run.", 5)
     else
-        S.notify("Core", "No cores this run. Leaving.", 4)
+        S.notify("Core", "No cores this run.", 4)
     end
+end
+
+function S.coreReturnLobby(before)
+    S.coreReportCores(before)
     S.teleportToLobby()
 end
 
@@ -24378,6 +24633,7 @@ function S.buildCoreTab(Window)
         CurrentValue = CoreFarm.openAll == true,
         Flag = "dtec_core_open",
         Callback = function(value)
+            CoreFarm._finished = false
             if not value then
                 S.stopCoreChestRun()
                 return
@@ -24451,7 +24707,7 @@ function S.buildCoreTab(Window)
         end,
     })
     tab:CreateToggle({
-        Name = "Go to Church after laps",
+        Name = "Go to Church at the end",
         CurrentValue = CoreFarm.church == true,
         Flag = "dtec_core_church",
         Callback = function(value)
@@ -24493,10 +24749,21 @@ function S.buildCoreTab(Window)
             S.coreSaveQueue()
         end,
     })
+    tab:CreateSlider({
+        Name = "Pick Up detection range (studs)",
+        Range = { 20, 2000 },
+        Increment = 10,
+        CurrentValue = CoreFarm.pickRange or 300,
+        Flag = "dtec_core_pick_range",
+        Callback = function(value)
+            CoreFarm.pickRange = math.clamp(tonumber(value) or 300, 20, 2000)
+            S.coreSaveQueue()
+        end,
+    })
     S.coreStartPickupLoop()
     tab:CreateParagraph({
         Title = "AutoCores",
-        Content = "Orden: 1) abre los cofres elegidos durante las Laps (velocidad: Chest laps speed). 2) Si Pick Up laps esta activado, hace las laps de Pick Up (1-10, velocidad: Pick Up laps speed) donde SOLO recoge items de la lista: todo Phoenix, Void o King's (shotgun, sword, rifle, pickaxe, revolver, chest, boots, helmet, legs), Excalibur, Revive Kit y Blackhole Gun. 3) Si Go to Church after laps esta activado, va al church, guarda tus gears y usa su teleport al lobby; si no, vuelve directo al lobby.",
+        Content = "Orden: 1) abre los cofres elegidos durante las Laps (velocidad: Chest laps speed). 2) Si Pick Up laps esta activado, hace las laps de Pick Up (1-10, velocidad: Pick Up laps speed) donde SOLO recoge items de la lista: todo Phoenix, Void o King's (shotgun, sword, rifle, pickaxe, revolver, chest, boots, helmet, legs), Excalibur, Revive Kit y Blackhole Gun. 3) Al terminar vuelve al drill y se queda ahi (no sale al lobby). 4) El church solo se visita tras completar las laps de Pick Up (con Pick Up laps y Go to Church at the end activados): va al church, guarda tus gears y usa su teleport al lobby; Open all chests queda encendido. Si no, vuelve al drill y se queda ahi.",
     })
 end
 
@@ -27274,201 +27541,18 @@ end
 
 
 -- ============================================================
--- Misc: Anti-AFK + settings persistentes + auto-ejecución por partida
+-- Misc: Anti-AFK + settings persistentes + auto rejoin
 --  * Autoguardado: cada cambio de la UI se guarda en
 --    klze_hub_configs/_autosave.json (y al teletransportarse).
 --  * Al iniciar el script se restaura solo y se reanuda el farm.
---  * Auto-ejecución: queue_on_teleport relanza el script al entrar
---    a la siguiente partida (nueva partida / lobby / rejoin).
 -- ============================================================
 S.Misc = {
     autosave = true,
-    autoexec = true,
     antiAfk = true,
-    source = "", -- vacío = se detecta solo; o URL / archivo del workspace
     autoRejoin = true,
     file = "klze_hub_configs/_autosave.json",
     _lastEncoded = nil,
-    _queued = false,
 }
-
-function S.miscQueueFn()
-    if typeof(queue_on_teleport) == "function" then
-        return queue_on_teleport
-    end
-    if type(syn) == "table" and typeof(syn.queue_on_teleport) == "function" then
-        return syn.queue_on_teleport
-    end
-    if type(fluxus) == "table" and typeof(fluxus.queue_on_teleport) == "function" then
-        return fluxus.queue_on_teleport
-    end
-    return nil
-end
-
-S.MISC_MARKER = "KLZE_DTEC_TERRA_SCRIPT" -- aparece en la cabecera de este script
-S.MISC_BUILD = "KLZE-TERRA-B13" -- identifica esta version exacta
-S.MISC_SOURCE_FILE = "klze_hub_configs/_source.txt"
-
--- true si el archivo del workspace es ESTE hub (por el marcador de la cabecera).
--- 2º valor: true si ademas es exactamente esta version.
-function S.miscFileIsThisHub(path)
-    if typeof(readfile) ~= "function" then
-        return false, false
-    end
-    if typeof(isfile) == "function" then
-        local okI, exists = pcall(isfile, path)
-        if not okI or not exists then
-            return false, false
-        end
-    end
-    local okR, content = pcall(readfile, path)
-    if not okR or type(content) ~= "string" then
-        return false, false
-    end
-    local head = content:sub(1, 4000)
-    if not head:find(S.MISC_MARKER, 1, true) then
-        return false, false
-    end
-    return true, head:find(S.MISC_BUILD, 1, true) ~= nil
-end
-
--- Lista de orígenes de ESTE script (en orden de prioridad). Solo entran archivos
--- con el marcador de la cabecera (nunca otro script como main1.lua) o URLs que
--- el usuario puso a mano.
-function S.miscSources()
-    local out, seen = {}, {}
-    local function add(src, trusted)
-        if type(src) ~= "string" then
-            return
-        end
-        src = src:gsub("^%s+", ""):gsub("%s+$", "")
-        src = src:gsub("^[@=]", "")
-        if src == "" or seen[src] then
-            return
-        end
-        if not src:match("^https?://") and not trusted then
-            local isHub = S.miscFileIsThisHub(src)
-            if not isHub then
-                return
-            end
-        end
-        seen[src] = true
-        out[#out + 1] = src
-    end
-    if typeof(getgenv) == "function" then
-        add(getgenv().KLZE_SCRIPT_SOURCE)
-    end
-    add(S.Misc.source)
-
-    -- Nombre del chunk (algunos executors lo ponen al cargar con loadfile).
-    pcall(function()
-        local chunk = debug.info(1, "s")
-        if type(chunk) == "string" then
-            add(chunk)
-        end
-    end)
-
-    -- Archivos del workspace con el marcador: primero la version exacta.
-    if typeof(listfiles) == "function" and typeof(readfile) == "function" then
-        local exact, other = {}, {}
-        pcall(function()
-            local n = 0
-            for _, path in ipairs(listfiles("")) do
-                local p = tostring(path):gsub("^%./", "")
-                local low = p:lower()
-                if low:match("%.lua$") or low:match("%.txt$") or low:match("%.luau$") then
-                    n += 1
-                    if n > 80 then
-                        break
-                    end
-                    local isHub, isExact = S.miscFileIsThisHub(p)
-                    if isHub then
-                        table.insert(isExact and exact or other, p)
-                    end
-                end
-            end
-        end)
-        for _, p in ipairs(exact) do
-            add(p, true)
-        end
-        -- Ruta guardada en una ejecucion anterior.
-        if typeof(isfile) == "function" and typeof(readfile) == "function" then
-            pcall(function()
-                if isfile(S.MISC_SOURCE_FILE) then
-                    add(readfile(S.MISC_SOURCE_FILE))
-                end
-            end)
-        end
-        for _, p in ipairs(other) do
-            add(p, true)
-        end
-    end
-    return out
-end
-
-function S.miscGetSource()
-    return S.miscSources()[1] or ""
-end
-
-function S.miscQueueReload(force)
-    local Misc = S.Misc
-    if not Misc.autoexec then
-        return false, "auto-exec OFF"
-    end
-    if Misc._queued and not force then
-        return true
-    end
-    local queue = S.miscQueueFn()
-    if not queue then
-        return false, "executor sin queue_on_teleport"
-    end
-    local sources = S.miscSources()
-    if #sources == 0 then
-        return false, "falta la ruta/URL del script"
-    end
-    local quoted = {}
-    for _, src in ipairs(sources) do
-        quoted[#quoted + 1] = string.format("%q", src)
-    end
-    local stub = string.format([[
-if not game:IsLoaded() then game.Loaded:Wait() end
-local env = (getgenv and getgenv()) or _G
-if env.__KLZE_AUTOEXEC_JOB == game.JobId then return end
-env.__KLZE_AUTOEXEC_JOB = game.JobId
-local list = { %s }
-for _, src in ipairs(list) do
-    local ok, code
-    if src:match("^https?://") then
-        ok, code = pcall(function() return game:HttpGet(src, true) end)
-    else
-        ok = (type(isfile) ~= "function") or isfile(src)
-        if ok then ok, code = pcall(readfile, src) end
-    end
-    if ok and type(code) == "string" and code ~= "" then
-        local fn, err = loadstring(code)
-        if fn then
-            env.KLZE_SCRIPT_SOURCE = src
-            fn()
-            return
-        end
-        warn("[KLZE] autoexec: " .. tostring(err))
-    end
-end
-warn("[KLZE] autoexec: no pude leer el script")
-]], table.concat(quoted, ", "))
-    local okQ, errQ = pcall(queue, stub)
-    if not okQ then
-        return false, tostring(errQ)
-    end
-    Misc._queued = true
-    pcall(function()
-        if typeof(writefile) == "function" then
-            S.configEnsureFolder()
-            writefile(S.MISC_SOURCE_FILE, sources[1])
-        end
-    end)
-    return true
-end
 
 function S.miscSave(force)
     local Misc = S.Misc
@@ -27554,7 +27638,6 @@ function S.miscStartRejoinWatch()
                 S.dmPrepareLeave()
             end
         end)
-        pcall(S.miscQueueReload, true)
         task.spawn(function()
             for attempt = 1, 30 do
                 pcall(function()
@@ -27593,10 +27676,6 @@ function S.miscBoot()
     if S.Misc.antiAfk and S._klzeHub and S._klzeHub.setAntiAfk then
         pcall(S._klzeHub.setAntiAfk, true)
     end
-    local okQ, errQ = S.miscQueueReload()
-    if not okQ and S.Misc.autoexec then
-        S.notify("Misc", "Auto-ejecución no activa: " .. tostring(errQ), 6)
-    end
 
     local gen = (typeof(getgenv) == "function" and ((getgenv().__KLZE_MISC_GEN or 0) + 1)) or 1
     if typeof(getgenv) == "function" then
@@ -27620,7 +27699,6 @@ function S.miscBoot()
             if S.Misc.autosave then
                 pcall(S.miscSave, true)
             end
-            pcall(S.miscQueueReload, false)
         end)
     end
     Players.PlayerRemoving:Connect(function(p)
@@ -27660,7 +27738,7 @@ function S.buildMiscTab(Window)
         end,
     })
 
-    tab:CreateSection("Partida tras partida")
+    tab:CreateSection("Settings")
     tab:CreateToggle({
         Name = "Guardar settings automáticamente",
         CurrentValue = Misc.autosave,
@@ -27672,33 +27750,6 @@ function S.buildMiscTab(Window)
             end
         end,
     })
-    tab:CreateToggle({
-        Name = "Auto-ejecutar en cada partida",
-        CurrentValue = Misc.autoexec,
-        Flag = "klze_misc_autoexec",
-        Callback = function(value)
-            Misc.autoexec = value == true
-            if Misc.autoexec and S._uiReady then
-                local ok, err = S.miscQueueReload(false)
-                if not ok then
-                    S.notify("Misc", tostring(err), 5)
-                end
-            end
-        end,
-    })
-    tab:CreateInput({
-        Name = "Script (archivo o URL)",
-        PlaceholderText = "vacío = se detecta solo (archivo con el marcador KLZE)",
-        RemoveTextAfterFocusLost = false,
-        Flag = "klze_misc_source",
-        Callback = function(text)
-            text = tostring(text or "")
-            if text ~= "" then
-                Misc.source = text
-                Misc._queued = false
-            end
-        end,
-    })
     tab:CreateButton({
         Name = "Guardar ahora",
         Callback = function()
@@ -27706,16 +27757,9 @@ function S.buildMiscTab(Window)
             S.notify("Misc", ok and "Settings guardados" or "No se pudo guardar", 3)
         end,
     })
-    tab:CreateButton({
-        Name = "Probar auto-ejecución",
-        Callback = function()
-            local ok, err = S.miscQueueReload(true)
-            S.notify("Misc", ok and ("Listo: se ejecutará en la próxima partida · " .. S.miscGetSource()) or tostring(err), 6)
-        end,
-    })
     tab:CreateParagraph({
         Title = "Cómo funciona",
-        Content = "Tus settings se guardan solos y se restauran al entrar a otra partida; si dejaste el farm activo, se reanuda. La auto-ejecución reconoce ESTE script por el marcador de su cabecera (nunca otro). Ejecútalo una primera vez desde un archivo guardado en la carpeta workspace de tu executor (con cualquier nombre); desde ahí se relanza solo en cada partida. Si lo cargas por URL, ponla en 'Script'. Si el juego te desconecta, Auto Rejoin vuelve a entrar por el lobby.",
+        Content = "Tus settings se guardan solos y se restauran al ejecutar el script otra vez. Si el juego te desconecta, Auto Rejoin vuelve a entrar por el lobby (después hay que ejecutar el script manualmente).",
     })
 end
 
@@ -27843,12 +27887,6 @@ end
 
 S.hubLog(HUB_NAME .. " started | PlaceId " .. game.PlaceId)
 
--- Deja encolada la auto-ejecución enseguida (no esperar a que cargue la UI).
-task.spawn(function()
-    task.wait(2)
-    pcall(S.miscQueueReload, false)
-end)
-
 workspace:GetAttributeChangedSignal("InCutScene"):Connect(function()
     if workspace:GetAttribute("InCutScene") == true then
         task.defer(function()
@@ -27904,6 +27942,16 @@ function S.corePullLoadedFlags()
     local pickSpd = flags.dtec_core_pick_speed
     if pickSpd and tonumber(pickSpd.CurrentValue) then
         CoreFarm.pickSpeed = math.clamp(tonumber(pickSpd.CurrentValue), 200, 4000)
+    end
+    local pickRng = flags.dtec_core_pick_range
+    if pickRng and tonumber(pickRng.CurrentValue) then
+        CoreFarm.pickRange = math.clamp(tonumber(pickRng.CurrentValue), 20, 2000)
+    end
+    if flags.dtec_core_pick_up then
+        CoreFarm.pickUp = S.coreToggleOn("dtec_core_pick_up")
+    end
+    if flags.dtec_core_instant_open then
+        CoreFarm.instantOpen = S.coreToggleOn("dtec_core_instant_open")
     end
     local pickLaps = flags.dtec_core_pick_laps
     if pickLaps and tonumber(pickLaps.CurrentValue) then
@@ -28016,7 +28064,7 @@ task.spawn(function()
                 if not Autofarm.enabled and not S.coreToggleOn("dtec_core_open") and not S.coreToggleOn("terra_autofarm") then
                     CoreFarm._userStop = false
                 end
-            elseif S.coreToggleOn("dtec_core_open") then
+            elseif S.coreToggleOn("dtec_core_open") and not CoreFarm._finished then
                 CoreFarm.openAll = true
             end
             local farmOn = Autofarm.enabled == true and typeof(Autofarm.origin) == "Vector3"
